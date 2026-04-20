@@ -1,0 +1,25 @@
+{
+  "features": [
+    "logret_1d",
+    "close_ma5",
+    "close_ma20",
+    "close_ma60",
+    "vol_ratio",
+    "rsi_n",
+    "k_n",
+    "d_n",
+    "macd_hist_n",
+    "bb_pos",
+    "atr_pct",
+    "hl_range",
+    "dist_52w",
+    "log_vol_z"
+  ],
+  "window": 60,
+  "horizons": [
+    5,
+    10,
+    20
+  ],
+  "trained_at": "2026-04-20T23:35:45.041049"
+}

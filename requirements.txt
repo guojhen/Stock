@@ -1,0 +1,31 @@
+# Core data
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+
+# Financial data
+yfinance>=0.2.40
+
+# Visualization / Report
+plotly>=5.18
+
+# ML / Ranking
+xgboost>=2.0
+
+# Deep Learning (CUDA 12.8 wheel; 使用純 CPU 可省略 --index-url)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+torch>=2.2
+
+# GPU grid search (Numba CUDA)
+# 若無 GPU 可略過以下 numba 相關依賴
+numba>=0.59
+# Windows + CUDA 12.x 需要以下 NVIDIA runtime wheels：
+# numba-cuda
+# nvidia-cuda-runtime-cu12
+# nvidia-cuda-nvcc-cu12
+# nvidia-cuda-nvrtc-cu12
+# nvidia-nvjitlink-cu12
+
+# HTML parsing (pandas read_html backend)
+html5lib>=1.1
+lxml>=5.0
