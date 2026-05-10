@@ -31,11 +31,20 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 KD_PERIOD = 9
 
-TAKE_PROFIT = 0.15        # 固定停利上限
+# A7：取消 +15% 固定停利，改以 ATR trailing + tier 1R/2R/3R 為主
+# TAKE_PROFIT 保留為「硬上限保險」（避免極端 outlier 失真），預設拉到 30%
+TAKE_PROFIT = 0.30
 STOP_LOSS = -0.05         # 硬停損下限
 MAX_HOLD_DAYS = 20
-ATR_STOP_MULT = 2.0       # 移動停利回檔 N 倍 ATR
-ATR_STOP_TRIGGER = 0.06   # 獲利超過 6% 後才啟用移動停利
+ATR_STOP_MULT = 2.5       # A7：trailing 改 2.5x ATR（原 2.0 過早砍長腳）
+ATR_STOP_TRIGGER = 0.04   # A7：獲利 4% 即啟用 trailing（比原 6% 更早保護成本）
+
+# D1：Volatility-aware trailing — 持有期分段 ATR 倍數
+ATR_TRAIL_EARLY = 1.5     # 持有 <= 10 日：緊（保護成本）
+ATR_TRAIL_MID = 2.5       # 11~30 日：中（讓利潤跑）
+ATR_TRAIL_LATE = 3.5      # > 30 日：寬（讓贏家奔跑）
+ATR_TRAIL_DAYS_EARLY = 10
+ATR_TRAIL_DAYS_LATE = 30
 
 
 # ── 資料結構 ──────────────────────────────────────────
@@ -294,8 +303,13 @@ def get_strategy_params(strat_name, best_params=None):
 
 def _simulate_trades(df, entry_indices, tp=TAKE_PROFIT, sl=STOP_LOSS,
                      max_hold=MAX_HOLD_DAYS, atr_mult=ATR_STOP_MULT,
-                     atr_trigger=ATR_STOP_TRIGGER):
-    """從進場點模擬交易；整合固定停利、硬停損、ATR 移動停利、時間停損。"""
+                     atr_trigger=ATR_STOP_TRIGGER,
+                     volatility_aware=True):
+    """從進場點模擬交易。
+    A7：tp 改為 hard-cap (預設 30%)，不再把 +15% 當主要出場。
+    D1：volatility_aware=True 時，trailing ATR 倍數依持有時間放寬：
+        ≤10 日 → 1.5x，11~30 日 → 2.5x，>30 日 → 3.5x。
+    """
     trades = []
     close = df['Close'].values
     atr = df['ATR'].values if 'ATR' in df.columns else np.full(len(close), np.nan)
@@ -321,20 +335,34 @@ def _simulate_trades(df, entry_indices, tp=TAKE_PROFIT, sl=STOP_LOSS,
                 peak = cj
             ret = (cj - entry_price) / entry_price
             peak_ret = (peak - entry_price) / entry_price
+            held = j - idx
+
+            # 硬上限（防 outlier）
             if ret >= tp:
                 exit_idx = j
-                exit_reason = '停利'
+                exit_reason = '停利上限'
                 break
             if ret <= sl:
                 exit_idx = j
                 exit_reason = '停損'
                 break
-            # ATR 移動停利：獲利達 trigger 後，若從高點回檔超過 atr_mult * ATR 則出場
+
+            # D1：Volatility-aware trailing
+            if volatility_aware:
+                if held <= ATR_TRAIL_DAYS_EARLY:
+                    eff_mult = ATR_TRAIL_EARLY
+                elif held <= ATR_TRAIL_DAYS_LATE:
+                    eff_mult = ATR_TRAIL_MID
+                else:
+                    eff_mult = ATR_TRAIL_LATE
+            else:
+                eff_mult = atr_mult
+
             atr_j = atr[j] if j < len(atr) else np.nan
             if (peak_ret >= atr_trigger and not np.isnan(atr_j)
-                    and atr_j > 0 and cj < peak - atr_mult * atr_j):
+                    and atr_j > 0 and cj < peak - eff_mult * atr_j):
                 exit_idx = j
-                exit_reason = '移動停利'
+                exit_reason = f'ATR trailing ({eff_mult:.1f}x)'
                 break
 
         exit_price = close[exit_idx]

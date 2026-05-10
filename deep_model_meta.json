@@ -13,7 +13,17 @@
     "atr_pct",
     "hl_range",
     "dist_52w",
-    "log_vol_z"
+    "log_vol_z",
+    "ret_5d_cum",
+    "ret_20d_cum",
+    "vol_of_vol_20d",
+    "pv_corr_20d",
+    "range_expand",
+    "volume_surge_5d",
+    "rsi_slope_5d",
+    "macd_hist_slope",
+    "squeeze_intensity",
+    "trend_strength"
   ],
   "window": 60,
   "horizons": [
@@ -21,5 +31,25 @@
     10,
     20
   ],
-  "trained_at": "2026-04-20T23:35:45.041049"
+  "model_type": "gru",
+  "conformal": {
+    "q_low": [
+      -0.09201445430517197,
+      -0.1150897964835167,
+      -0.1445857435464859
+    ],
+    "q_high": [
+      0.1746707558631897,
+      0.2761325240135193,
+      0.4556368589401245
+    ],
+    "mae": [
+      0.038900163024663925,
+      0.057369034737348557,
+      0.0882418230175972
+    ],
+    "n_samples": 168148,
+    "source": "calib"
+  },
+  "trained_at": "2026-05-10T23:26:14.171549"
 }

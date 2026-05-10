@@ -47,8 +47,8 @@ HORIZONS = (5, 10, 20)       # 預測 T+5, T+10, T+20 報酬
 UP_THRESHOLD = 0.05          # T+20 > 5% 視為正樣本
 MIN_HISTORY = WINDOW + max(HORIZONS) + 20
 
-# 特徵欄位（每個時間步一個 vector）
-SEQ_FEATURES = [
+# 基礎特徵（14 個，原版相容）
+BASE_SEQ_FEATURES = [
     'logret_1d',
     'close_ma5', 'close_ma20', 'close_ma60',
     'vol_ratio',
@@ -56,6 +56,22 @@ SEQ_FEATURES = [
     'macd_hist_n', 'bb_pos', 'atr_pct', 'hl_range',
     'dist_52w', 'log_vol_z',
 ]
+
+# Tier C 進階價量衍生特徵（10 個）：從價量單獨衍生、無需外部資料
+EXTRA_SEQ_FEATURES = [
+    'ret_5d_cum', 'ret_20d_cum',     # 短/中期累積報酬
+    'vol_of_vol_20d',                # 波動度的波動度（Volatility-of-Volatility）
+    'pv_corr_20d',                   # 價量 Pearson 相關（+=齊漲，−=背離）
+    'range_expand',                  # HL 範圍 20 日 z-score（突破前放大）
+    'volume_surge_5d',               # 近 5 日量 / 20 日量（爆量訊號）
+    'rsi_slope_5d',                  # RSI 5 日斜率（動能反轉）
+    'macd_hist_slope',               # MACD 柱狀體 5 日斜率
+    'squeeze_intensity',             # 布林收斂強度：is_squeeze 的 EMA(span=10)，0~1（C15 重新命名）
+    'trend_strength',                # ADX-like: MA5/MA20/MA60 方向一致性
+]
+
+# 預設訓練特徵 = base + extra（24 個）
+SEQ_FEATURES = BASE_SEQ_FEATURES + EXTRA_SEQ_FEATURES
 
 
 # ──────────────────────────────────────────────────────────
@@ -97,6 +113,52 @@ def build_seq_features(df: pd.DataFrame) -> pd.DataFrame:
     vol_mean = log_v.rolling(60, min_periods=20).mean()
     vol_std = log_v.rolling(60, min_periods=20).std().replace(0, np.nan)
     out['log_vol_z'] = (log_v - vol_mean) / vol_std
+
+    # ========== Tier C 進階特徵 ==========
+    logret = out['logret_1d']
+    out['ret_5d_cum'] = logret.rolling(5, min_periods=3).sum()
+    out['ret_20d_cum'] = logret.rolling(20, min_periods=10).sum()
+
+    ret_std_20 = logret.rolling(20, min_periods=10).std()
+    out['vol_of_vol_20d'] = (
+        ret_std_20.rolling(20, min_periods=10).std()
+        / ret_std_20.rolling(20, min_periods=10).mean().replace(0, np.nan)
+    )
+
+    out['pv_corr_20d'] = (
+        logret.rolling(20, min_periods=10).corr(log_v.diff())
+    )
+
+    hl_rng = (h - l) / c.replace(0, np.nan)
+    rng_mean = hl_rng.rolling(20, min_periods=10).mean()
+    rng_std = hl_rng.rolling(20, min_periods=10).std().replace(0, np.nan)
+    out['range_expand'] = (hl_rng - rng_mean) / rng_std
+
+    v_5 = v.rolling(5, min_periods=3).mean()
+    v_20 = v.rolling(20, min_periods=10).mean().replace(0, np.nan)
+    out['volume_surge_5d'] = (v_5 / v_20).apply(np.log)
+
+    rsi_raw = df['RSI']
+    out['rsi_slope_5d'] = (rsi_raw - rsi_raw.shift(5)) / 5.0 / 100.0
+
+    mhist = df['MACD_hist']
+    out['macd_hist_slope'] = (mhist - mhist.shift(5)) / 5.0 / c.replace(0, np.nan)
+
+    # 布林收斂強度：BB_width 是否低於 60 日中位數，再做 EMA(span=10) 平滑為 0~1
+    # （越接近 1 表示近期持續處於收斂狀態，準備突破）
+    bb_w_pct = (df['BB_upper'] - df['BB_lower']) / c.replace(0, np.nan)
+    bb_w_med = bb_w_pct.rolling(60, min_periods=20).median()
+    is_squeeze = (bb_w_pct < bb_w_med).astype(float)
+    out['squeeze_intensity'] = is_squeeze.ewm(span=10, adjust=False).mean()
+
+    # 趨勢一致性：MA5 > MA20 > MA60 = +1；全部相反 = -1
+    ma5 = df['MA5']
+    ma20 = df['MA20']
+    trend = (
+        np.sign(ma5 - ma20).fillna(0)
+        + np.sign(ma20 - ma60).fillna(0)
+    ) / 2.0
+    out['trend_strength'] = trend
 
     # 剪掉極端值以穩定訓練
     out = out.clip(-5, 5)
@@ -238,6 +300,62 @@ class PriceGRU(nn.Module):
         return self.reg_head(h), self.cls_head(h).squeeze(-1)
 
 
+class PriceTransformer(nn.Module):
+    """Tier B2: Transformer Encoder 替代 GRU。
+    同樣吃 (B, T, F) 序列；加上 sinusoidal positional encoding。
+    """
+    def __init__(self, n_features: int, hidden: int = 64,
+                 layers: int = 3, dropout: float = 0.25,
+                 n_horizons: int = 3, n_heads: int = 4, window: int = 60):
+        super().__init__()
+        self.input_proj = nn.Linear(n_features, hidden)
+        pe = torch.zeros(window, hidden)
+        pos = torch.arange(0, window, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, hidden, 2).float() * -(math.log(10000.0) / hidden))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pos_enc', pe.unsqueeze(0))
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=n_heads,
+            dim_feedforward=hidden * 4,
+            dropout=dropout, batch_first=True, activation='gelu',
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        self.norm = nn.LayerNorm(hidden)
+        self.dropout = nn.Dropout(dropout)
+        self.reg_head = nn.Sequential(
+            nn.Linear(hidden, 64), nn.GELU(),
+            nn.Linear(64, n_horizons),
+        )
+        self.cls_head = nn.Sequential(
+            nn.Linear(hidden, 64), nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x):
+        h = self.input_proj(x)
+        h = h + self.pos_enc[:, :h.size(1)]
+        h = self.encoder(h)
+        # 取最後一個 time-step 作為 query
+        h = self.norm(h[:, -1, :])
+        h = self.dropout(h)
+        return self.reg_head(h), self.cls_head(h).squeeze(-1)
+
+
+def build_model(model_type: str, n_features: int, hidden: int, layers: int,
+                dropout: float, n_horizons: int, window: int = WINDOW) -> nn.Module:
+    if model_type == 'transformer':
+        return PriceTransformer(
+            n_features=n_features, hidden=hidden, layers=layers,
+            dropout=dropout, n_horizons=n_horizons, window=window,
+        )
+    return PriceGRU(
+        n_features=n_features, hidden=hidden,
+        layers=layers, dropout=dropout, n_horizons=n_horizons,
+    )
+
+
 # ──────────────────────────────────────────────────────────
 # 訓練
 # ──────────────────────────────────────────────────────────
@@ -252,40 +370,65 @@ class TrainConfig:
     batch_size: int = 256
     epochs: int = 40
     patience: int = 8
-    train_pct: float = 0.8
+    # Tier A3 修正：train / val / calib 三段時間序列切分
+    # 預設 70% train + 15% val（early-stopping）+ 15% calib（conformal quantile）
+    train_pct: float = 0.70
+    val_pct: float = 0.15  # 接著 train_pct，剩下做 calib
     reg_weight: float = 1.0
     cls_weight: float = 0.5
     huber_delta: float = 0.05
     grad_clip: float = 1.0
+    model_type: str = 'gru'  # 'gru' or 'transformer'
+    n_heads: int = 4         # 僅 transformer 使用
 
 
 def train_model(X, Yr, Yc, D, cfg: TrainConfig,
                 device: str = 'cuda') -> Tuple[nn.Module, dict]:
-    # 時間序列切分
+    # Tier A3 修正：時間序列切分為 train / val / calib（避免 conformal data leakage）
     order = np.argsort(D)
     X, Yr, Yc, D = X[order], Yr[order], Yc[order], D[order]
     unique_dates = np.unique(D)
-    split_date = unique_dates[int(len(unique_dates) * cfg.train_pct)]
-    train_mask = D < split_date
-    valid_mask = ~train_mask
+    n_dates = len(unique_dates)
+    train_end = int(n_dates * cfg.train_pct)
+    val_end = int(n_dates * (cfg.train_pct + cfg.val_pct))
+    # 至少留 1 天做 calib，否則退回兩段切分
+    if val_end >= n_dates:
+        val_end = max(train_end + 1, n_dates - 1)
+    train_split_date = unique_dates[train_end]
+    val_split_date = unique_dates[val_end]
+
+    train_mask = D < train_split_date
+    valid_mask = (D >= train_split_date) & (D < val_split_date)
+    calib_mask = D >= val_split_date
+    if calib_mask.sum() == 0:
+        # fallback: 沒有 calib 樣本（資料太短），與 valid 共用（會有輕微洩漏）
+        calib_mask = valid_mask
+        print("  ⚠ 資料量不足獨立 calibration set，conformal 退回 valid set")
 
     print(f"\n===== 訓練 PriceGRU =====")
     print(f"  train: {train_mask.sum():,}  valid: {valid_mask.sum():,}  "
-          f"(split at {pd.Timestamp(split_date).date()})")
+          f"calib: {calib_mask.sum():,}")
+    print(f"  splits: train→{pd.Timestamp(train_split_date).date()}  "
+          f"val→{pd.Timestamp(val_split_date).date()}")
 
     train_ds = SlidingWindowDataset(X[train_mask], Yr[train_mask], Yc[train_mask],
                                     D[train_mask], None)
     valid_ds = SlidingWindowDataset(X[valid_mask], Yr[valid_mask], Yc[valid_mask],
                                     D[valid_mask], None)
+    calib_ds = SlidingWindowDataset(X[calib_mask], Yr[calib_mask], Yc[calib_mask],
+                                    D[calib_mask], None)
 
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
                               shuffle=True, drop_last=False)
     valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size * 2,
                               shuffle=False)
+    calib_loader = DataLoader(calib_ds, batch_size=cfg.batch_size * 2,
+                              shuffle=False)
 
-    model = PriceGRU(
-        n_features=X.shape[2], hidden=cfg.hidden,
+    model = build_model(
+        cfg.model_type, n_features=X.shape[2], hidden=cfg.hidden,
         layers=cfg.layers, dropout=cfg.dropout, n_horizons=Yr.shape[1],
+        window=X.shape[1],
     ).to(device)
 
     opt = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -368,6 +511,96 @@ def train_model(X, Yr, Yc, D, cfg: TrainConfig,
 
     if best_state is not None:
         model.load_state_dict(best_state)
+
+    # ========== Tier D2 (A3 fixed): Conformal residuals ==========
+    # 使用獨立 calibration set（不參與 early stopping）以避免區間被低估
+    model.eval()
+    all_pred_r, all_true_r = [], []
+    with torch.no_grad():
+        for xb, yrb, _ in calib_loader:
+            xb = xb.to(device)
+            pr, _ = model(xb)
+            all_pred_r.append(pr.cpu().numpy())
+            all_true_r.append(yrb.numpy())
+    if all_pred_r:
+        pred_r_v = np.concatenate(all_pred_r)
+        true_r_v = np.concatenate(all_true_r)
+        residuals = true_r_v - pred_r_v
+        conformal = {
+            'q_low': np.percentile(residuals, 2.5, axis=0).tolist(),
+            'q_high': np.percentile(residuals, 97.5, axis=0).tolist(),
+            'mae': np.mean(np.abs(residuals), axis=0).tolist(),
+            'n_samples': int(len(residuals)),
+            'source': 'calib' if calib_mask.sum() > 0 and not np.array_equal(calib_mask, valid_mask) else 'valid',
+        }
+    else:
+        conformal = {'q_low': [0]*Yr.shape[1], 'q_high': [0]*Yr.shape[1],
+                     'mae': [0]*Yr.shape[1], 'n_samples': 0, 'source': 'empty'}
+    history['conformal'] = conformal
+    print(f"  Conformal 95% 區間 (T+20, source={conformal.get('source','?')}, n={conformal.get('n_samples',0)}): "
+          f"[{conformal['q_low'][-1]*100:+.2f}%, {conformal['q_high'][-1]*100:+.2f}%] "
+          f"(MAE {conformal['mae'][-1]*100:.2f}%)")
+
+    # ========== Tier D17：模型校準診斷（reliability + IC + threshold hit-rate） ==========
+    # 在 calib set（或 valid 退路）上量測：
+    #   • Spearman IC（rank correlation）@5/10/20
+    #   • up_prob 分桶後實際 T+20 > 5% 命中率（reliability diagram）
+    #   • up_prob > {0.5, 0.6, 0.7} 的 precision
+    diag_loader = calib_loader if calib_mask.sum() > 0 and not np.array_equal(calib_mask, valid_mask) else valid_loader
+    model.eval()
+    pr_all, pc_all, yr_all, yc_all = [], [], [], []
+    with torch.no_grad():
+        for xb, yrb, ycb in diag_loader:
+            xb = xb.to(device)
+            pr, pc = model(xb)
+            pr_all.append(pr.cpu().numpy())
+            pc_all.append(torch.sigmoid(pc).cpu().numpy())
+            yr_all.append(yrb.numpy())
+            yc_all.append(ycb.numpy())
+    if pr_all:
+        pr_all = np.concatenate(pr_all)
+        pc_all = np.concatenate(pc_all)
+        yr_all = np.concatenate(yr_all)
+        yc_all = np.concatenate(yc_all)
+        ic = {f"h{HORIZONS[i]}": float(pd.Series(pr_all[:, i]).corr(
+                pd.Series(yr_all[:, i]), method='spearman'))
+              for i in range(pr_all.shape[1])}
+        # Reliability: 把 up_prob 切 5 桶
+        bins = [0.0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 1.01]
+        bucket_idx = np.digitize(pc_all, bins) - 1
+        reliability = []
+        for b in range(len(bins) - 1):
+            mask = bucket_idx == b
+            if mask.sum() < 10:
+                continue
+            reliability.append({
+                'bin': f"[{bins[b]:.2f}, {bins[b+1]:.2f})",
+                'pred_mean': float(pc_all[mask].mean()),
+                'actual_rate': float(yc_all[mask].mean()),
+                'n': int(mask.sum()),
+            })
+        precisions = {}
+        for thr in (0.5, 0.6, 0.7):
+            sel = pc_all >= thr
+            precisions[f"p>={thr}"] = (
+                {'n': int(sel.sum()),
+                 'precision': float(yc_all[sel].mean()) if sel.sum() else None}
+            )
+        history['calibration'] = {
+            'ic_spearman': ic,
+            'reliability': reliability,
+            'precision_at_threshold': precisions,
+        }
+        print("\n  ── 校準診斷（Calibration Check）──")
+        ic_str = ' | '.join(f"{k}={v:+.3f}" for k, v in ic.items())
+        print(f"   Spearman IC: {ic_str}")
+        for r in reliability:
+            print(f"   bin {r['bin']}: pred={r['pred_mean']:.2f} | "
+                  f"actual={r['actual_rate']:.2f} | n={r['n']}")
+        for k, v in precisions.items():
+            if v['precision'] is not None:
+                print(f"   {k} → precision={v['precision']:.2f} (n={v['n']})")
+
     return model, history
 
 
@@ -375,7 +608,9 @@ def train_model(X, Yr, Yc, D, cfg: TrainConfig,
 # 儲存 / 載入 / 推論
 # ──────────────────────────────────────────────────────────
 
-def save_model(model: nn.Module, path: str = MODEL_FILE, cfg: Optional[TrainConfig] = None):
+def save_model(model: nn.Module, path: str = MODEL_FILE,
+               cfg: Optional[TrainConfig] = None,
+               conformal: Optional[dict] = None):
     torch.save({
         'state_dict': model.state_dict(),
         'features': SEQ_FEATURES,
@@ -383,10 +618,15 @@ def save_model(model: nn.Module, path: str = MODEL_FILE, cfg: Optional[TrainConf
         'horizons': list(HORIZONS),
         'hidden': cfg.hidden if cfg else 64,
         'layers': cfg.layers if cfg else 2,
+        'model_type': (cfg.model_type if cfg else 'gru'),
+        'n_heads': (cfg.n_heads if cfg else 4),
+        'conformal': conformal or {},
     }, path)
     meta = {
         'features': SEQ_FEATURES, 'window': WINDOW,
         'horizons': list(HORIZONS),
+        'model_type': (cfg.model_type if cfg else 'gru'),
+        'conformal': conformal or {},
         'trained_at': pd.Timestamp.now().isoformat(),
     }
     with open(META_FILE, 'w', encoding='utf-8') as f:
@@ -394,46 +634,95 @@ def save_model(model: nn.Module, path: str = MODEL_FILE, cfg: Optional[TrainConf
     print(f"  模型已儲存: {path}")
 
 
-def load_model(path: str = MODEL_FILE, device: str = 'cuda') -> Optional[nn.Module]:
+_LOADED_CKPT_CACHE: dict = {}
+# D16：每個 ohlcv_cache 對應一份「全部 SEQ_FEATURES 的 DataFrame」快取
+# key = id(ohlcv_cache)，避免 deep / breakout 重算同一份特徵
+_FEATURE_CACHE: dict = {}
+
+
+def load_model(path: str = MODEL_FILE, device: str = 'cuda',
+               return_ckpt: bool = False):
     if not os.path.exists(path):
-        return None
+        return (None, None) if return_ckpt else None
     try:
         ckpt = torch.load(path, map_location=device, weights_only=False)
-        model = PriceGRU(
+        model = build_model(
+            model_type=ckpt.get('model_type', 'gru'),
             n_features=len(ckpt['features']),
             hidden=ckpt.get('hidden', 64),
             layers=ckpt.get('layers', 2),
             dropout=0.0,
             n_horizons=len(ckpt['horizons']),
+            window=ckpt.get('window', WINDOW),
         ).to(device)
         model.load_state_dict(ckpt['state_dict'])
         model.eval()
+        _LOADED_CKPT_CACHE[path] = ckpt
+        if return_ckpt:
+            return model, ckpt
         return model
     except Exception as e:
         print(f"⚠ 載入 {path} 失敗: {e}")
-        return None
+        return (None, None) if return_ckpt else None
+
+
+def get_loaded_ckpt(path: str = MODEL_FILE) -> Optional[dict]:
+    return _LOADED_CKPT_CACHE.get(path)
+
+
+def _get_feature_df(sid: str, df: pd.DataFrame, ohlcv_cache_id: int):
+    """D16：對 (ohlcv_cache, sid) 快取 build_seq_features 結果，避免 deep/breakout 重算。"""
+    bucket = _FEATURE_CACHE.setdefault(ohlcv_cache_id, {})
+    if sid in bucket:
+        return bucket[sid]
+    dfc = df.copy()
+    if 'ATR' not in dfc.columns:
+        bt._add_indicators(dfc)
+    feats = build_seq_features(dfc)
+    bucket[sid] = (feats, dfc)
+    return bucket[sid]
+
+
+def clear_feature_cache(ohlcv_cache_id: Optional[int] = None):
+    """釋放快取（呼叫者保有 ohlcv_cache 物件就能拿到對應 id）。"""
+    if ohlcv_cache_id is None:
+        _FEATURE_CACHE.clear()
+    else:
+        _FEATURE_CACHE.pop(ohlcv_cache_id, None)
 
 
 def build_live_windows(
     stock_ids: Sequence[str],
     ohlcv_cache: Optional[dict] = None,
     period: str = '9mo',
+    feature_cols: Optional[List[str]] = None,
 ) -> Tuple[np.ndarray, List[str], List[pd.Timestamp], List[float]]:
-    """建立推論用的最新視窗：每支股票輸出最後一個 60 天視窗。"""
+    """建立推論用的最新視窗：每支股票輸出最後一個 60 天視窗。
+    feature_cols 預設使用模組 SEQ_FEATURES；若模型是舊版只有 14 特徵，
+    傳入 ckpt['features'] 可保持相容。
+
+    D16：對相同 ohlcv_cache 物件，特徵運算結果會被快取共用（deep / breakout 都受惠）。
+    """
     if ohlcv_cache is None:
         ohlcv_cache = bt._batch_download(list(stock_ids), period=period)
+
+    use_cols = feature_cols or SEQ_FEATURES
+    cache_id = id(ohlcv_cache)
 
     Xs, sids, dates, closes = [], [], [], []
     for sid in stock_ids:
         df = ohlcv_cache.get(sid)
         if df is None or len(df) < WINDOW + 10:
             continue
-        dfc = df.copy()
-        if 'ATR' not in dfc.columns:
-            bt._add_indicators(dfc)
-        feats = build_seq_features(dfc)
-        arr = feats[SEQ_FEATURES].values.astype(np.float32)
-        # 從尾端往前找一個沒有 NaN 的視窗
+        feats, dfc = _get_feature_df(sid, df, cache_id)
+        # 若 checkpoint 要的欄位本次沒算出（舊模型相容），補 0 避免炸裂
+        missing = [c for c in use_cols if c not in feats.columns]
+        if missing:
+            for c in missing:
+                feats = feats.assign(**{c: 0.0})
+            # 寫回 cache 以便下次直接取
+            _FEATURE_CACHE[cache_id][sid] = (feats, dfc)
+        arr = feats[use_cols].values.astype(np.float32)
         idx = len(arr) - 1
         while idx >= WINDOW - 1:
             w = arr[idx - WINDOW + 1: idx + 1]
@@ -446,7 +735,7 @@ def build_live_windows(
             idx -= 1
 
     if not Xs:
-        return np.zeros((0, WINDOW, len(SEQ_FEATURES)), dtype=np.float32), [], [], []
+        return np.zeros((0, WINDOW, len(use_cols)), dtype=np.float32), [], [], []
     return np.stack(Xs), sids, dates, closes
 
 
@@ -462,10 +751,131 @@ def predict_scores(model: nn.Module, X: np.ndarray,
         return pred_r.cpu().numpy(), torch.sigmoid(pred_c).cpu().numpy()
 
 
+# ──────────────────────────────────────────────────────────
+# 統一預測 helper：Tier A / D2 下游使用
+# ──────────────────────────────────────────────────────────
+
+def predict_all_for_stocks(
+    stock_ids: Sequence[str],
+    ohlcv_cache: Optional[dict] = None,
+    period: str = '9mo',
+    model_path: str = MODEL_FILE,
+    device: Optional[str] = None,
+) -> dict:
+    """下游統一入口：給代號清單，回傳
+        { sid: {close, pred_5d, pred_10d, pred_20d, up_prob,
+                lower_20d, upper_20d, mae_20d, deep_score, target_price} }
+    若模型不存在回傳 {}。
+    """
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model, ckpt = load_model(model_path, device=device, return_ckpt=True)
+    if model is None:
+        return {}
+    features = ckpt.get('features', SEQ_FEATURES)
+    horizons = ckpt.get('horizons', list(HORIZONS))
+    conformal = ckpt.get('conformal') or {}
+    X, sids, _dates, closes = build_live_windows(
+        stock_ids, ohlcv_cache=ohlcv_cache, period=period,
+        feature_cols=features,
+    )
+    if len(X) == 0:
+        return {}
+    pred_r, up_p = predict_scores(model, X, device=device)
+    # ret_20d clip + normalize 做 deep_score
+    ret20 = pred_r[:, -1]
+    ret_clip = np.clip(ret20, -0.15, 0.30)
+    if ret_clip.max() > ret_clip.min():
+        ret_norm = (ret_clip - ret_clip.min()) / (ret_clip.max() - ret_clip.min()) * 100
+    else:
+        ret_norm = np.full_like(ret_clip, 50.0)
+    deep_score = 0.4 * ret_norm + 0.6 * up_p * 100
+
+    q_low = conformal.get('q_low') or [None] * len(horizons)
+    q_high = conformal.get('q_high') or [None] * len(horizons)
+    mae = conformal.get('mae') or [None] * len(horizons)
+
+    out: dict = {}
+    skipped_nan = 0
+    for i, sid in enumerate(sids):
+        p20 = float(pred_r[i, -1])
+        c = float(closes[i])
+        up = float(up_p[i])
+        ds = float(deep_score[i])
+        # B8：過濾 NaN / Inf 預測（防止下游 cohort/stacking 傳染）
+        if not (np.isfinite(p20) and np.isfinite(up) and np.isfinite(ds) and np.isfinite(c)):
+            skipped_nan += 1
+            continue
+        # Conformal interval on ret_20d
+        lo = p20 + q_low[-1] if q_low[-1] is not None else None
+        hi = p20 + q_high[-1] if q_high[-1] is not None else None
+        out[str(sid)] = {
+            'close': c,
+            'pred_5d': float(pred_r[i, 0]),
+            'pred_10d': float(pred_r[i, 1]) if pred_r.shape[1] > 2 else None,
+            'pred_20d': p20,
+            'up_prob': up,
+            'lower_20d': float(lo) if lo is not None else None,
+            'upper_20d': float(hi) if hi is not None else None,
+            'mae_20d': float(mae[-1]) if mae[-1] is not None else None,
+            'deep_score': ds,
+            'target_price': round(c * (1 + p20), 2) if c > 0 else None,
+            'lower_price': round(c * (1 + lo), 2) if (lo is not None and c > 0) else None,
+            'upper_price': round(c * (1 + hi), 2) if (hi is not None and c > 0) else None,
+        }
+    if skipped_nan:
+        print(f"  · 略過 {skipped_nan} 檔（NaN/Inf 預測）")
+    # B7：模型推論完釋放 GPU 快取
+    try:
+        del model
+        if device.startswith('cuda') and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return out
+
+
+def explain_prediction(
+    model: nn.Module, x_window: np.ndarray,
+    feature_names: List[str], target: str = 'cls',
+    n_steps: int = 32, device: str = 'cuda',
+    top_k: int = 5,
+) -> List[Tuple[str, float]]:
+    """Tier D3: Integrated Gradients 手寫實作，回傳每個特徵的平均貢獻 top-K。
+    target ∈ {'cls', 'ret20'}。"""
+    if x_window.ndim == 2:
+        x_window = x_window[None, ...]
+    x = torch.from_numpy(x_window.astype(np.float32)).to(device)
+    baseline = torch.zeros_like(x)
+    steps = torch.linspace(0.0, 1.0, n_steps, device=device).view(-1, 1, 1, 1)
+    interp = baseline + steps * (x - baseline)  # (S, B, T, F)
+    interp = interp.view(-1, x.size(1), x.size(2))
+    interp.requires_grad_(True)
+
+    pred_r, pred_c = model(interp)
+    if target == 'cls':
+        out_sum = pred_c.sum()
+    else:
+        out_sum = pred_r[:, -1].sum()
+    grads = torch.autograd.grad(out_sum, interp)[0]
+    grads = grads.view(n_steps, x.size(0), x.size(1), x.size(2))
+    avg_grads = grads.mean(dim=0)  # (B, T, F)
+    attributions = (x - baseline) * avg_grads  # IG
+    # 沿時間軸平均 → 每特徵一個貢獻值
+    contrib = attributions.mean(dim=1).squeeze(0).detach().cpu().numpy()
+    pairs = sorted(
+        [(feature_names[i], float(contrib[i])) for i in range(len(feature_names))],
+        key=lambda x: abs(x[1]), reverse=True,
+    )
+    return pairs[:top_k]
+
+
 def predict_ranks(model: nn.Module, stock_ids: Sequence[str],
                   top_n: int = 30, period: str = '9mo',
-                  device: str = 'cuda') -> pd.DataFrame:
-    X, sids, dates, closes = build_live_windows(stock_ids, period=period)
+                  device: str = 'cuda',
+                  feature_cols: Optional[List[str]] = None) -> pd.DataFrame:
+    X, sids, dates, closes = build_live_windows(stock_ids, period=period,
+                                                feature_cols=feature_cols)
     if len(X) == 0:
         return pd.DataFrame()
     pred_r, up_p = predict_scores(model, X, device=device)
@@ -537,21 +947,32 @@ def cmd_train(args):
         dropout=args.dropout, lr=args.lr,
         batch_size=args.batch_size, epochs=args.epochs,
         patience=args.patience,
+        model_type=getattr(args, 'model', 'gru'),
+        n_heads=getattr(args, 'n_heads', 4),
     )
     model, history = train_model(X, Yr, Yc, D, cfg, device=device)
-    save_model(model, args.model_out, cfg)
+    save_model(model, args.model_out, cfg, conformal=history.get('conformal'))
+    # history 中有 numpy array 要轉純 python
+    hist_serializable = {
+        'train': history.get('train', []),
+        'valid': history.get('valid', []),
+        'valid_ic': history.get('valid_ic', []),
+        'conformal': history.get('conformal', {}),
+        'calibration': history.get('calibration', {}),
+    }
     with open('deep_model_history.json', 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+        json.dump(hist_serializable, f, ensure_ascii=False, indent=2)
 
 
 def cmd_predict(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = load_model(args.model_out, device=device)
+    model, ckpt = load_model(args.model_out, device=device, return_ckpt=True)
     if model is None:
         raise SystemExit(f"❌ 模型 {args.model_out} 不存在，請先 train")
     stock_ids = _resolve_stocks(args.stocks, args.extra)
     result = predict_ranks(model, stock_ids, top_n=args.top_n,
-                           period=args.period, device=device)
+                           period=args.period, device=device,
+                           feature_cols=ckpt.get('features'))
     if result.empty:
         print("❌ 無可用特徵")
         return
@@ -575,6 +996,10 @@ def main():
     pt.add_argument('--lr', type=float, default=1e-3)
     pt.add_argument('--patience', type=int, default=8)
     pt.add_argument('--model-out', default=MODEL_FILE)
+    pt.add_argument('--model', default='gru', choices=['gru', 'transformer'],
+                    help='模型架構：gru (預設) 或 transformer (Tier B2)')
+    pt.add_argument('--n-heads', type=int, default=4,
+                    help='Transformer attention head 數')
     pt.set_defaults(func=cmd_train)
 
     pp = sub.add_parser('predict')

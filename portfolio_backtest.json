@@ -1,0 +1,36 @@
+{
+  "config": {
+    "top_n": 10,
+    "rebalance_days": 20,
+    "lookback_days": 365,
+    "initial_capital": 1000000.0,
+    "cost_pct": 0.005,
+    "score_col": "三層融合"
+  },
+  "period": {
+    "start": "2026-05-03",
+    "end": "2026-05-10",
+    "days": 7
+  },
+  "metrics": {
+    "total_return": 0.025917771329458716,
+    "ann_return": 2.796997034309876,
+    "sharpe": 2.5099800796022267,
+    "max_drawdown": 0.0,
+    "win_rate": 0.0,
+    "n_trades": 10,
+    "avg_win": 0.0,
+    "avg_loss": 0.0,
+    "final_equity": 1025917.7713294587
+  },
+  "equity_curve": [
+    [
+      "2026-05-03",
+      1000000.0
+    ],
+    [
+      "2026-05-10",
+      1025917.7713294587
+    ]
+  ]
+}

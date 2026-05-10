@@ -83,6 +83,26 @@ TASKS: Dict[str, Task] = {
         timeout_sec=60 * 60,
         condition=_is_weekend,
     ),
+    'breakout_train': Task(
+        key='breakout_train',
+        description='突破分類器重訓 (breakout_model.pt) — Focal Loss GRU',
+        interval_days=14,
+        command=[sys.executable, 'breakout_classifier.py', 'train',
+                 '--stocks', 'auto', '--period', '3y', '--epochs', '30'],
+        artifact='breakout_model.pt',
+        timeout_sec=45 * 60,
+        condition=_is_weekend,
+    ),
+    'stacking_retrain': Task(
+        key='stacking_retrain',
+        description='Stacking 元模型重訓（需累積 ≥200 筆 stacking_train_log.csv）',
+        interval_days=30,
+        command=[sys.executable, 'stacking_meta.py', 'train'],
+        artifact='stacking_meta.json',
+        timeout_sec=5 * 60,
+        condition=_is_weekend,
+        enabled=False,  # 預設關閉，等使用者累積資料
+    ),
 }
 
 
@@ -223,9 +243,33 @@ def run_scheduled_tasks(verbose: bool = True) -> List[dict]:
         return results
 
     if verbose:
-        total_est = sum(t.timeout_sec for t in to_run) // 60
-        print(f"\n★ 將執行 {len(to_run)} 個任務（預估上限 {total_est} 分鐘）")
-        print("  注：此為超時上限，實際通常短很多。若要略過請設定 STRATEGY_SKIP_SCHEDULER=1")
+        # C11：偵測是否為「首次部署」並給出更友善的提示
+        first_runs = [t for t in to_run if not os.path.exists(t.artifact)]
+        # 典型實際耗時估計（分鐘）— 比 timeout_sec 更貼近現實
+        typical_minutes = {
+            'gpu_grid': 10,
+            'ml_train': 5,
+            'deep_train': 15,
+            'breakout_train': 12,
+            'stacking_retrain': 1,
+        }
+        typical_total = sum(typical_minutes.get(t.key, 5) for t in to_run)
+        timeout_total = sum(t.timeout_sec for t in to_run) // 60
+
+        if first_runs:
+            print(f"\n★ 偵測到 **首次部署** {len(first_runs)} 個模型尚未訓練：")
+            for t in first_runs:
+                est = typical_minutes.get(t.key, 5)
+                print(f"    - {t.key:14s} 預估 ~{est} 分鐘 → 將產出 {t.artifact}")
+            other = [t for t in to_run if t not in first_runs]
+            if other:
+                print(f"  另有 {len(other)} 個到期任務需執行")
+            print(f"  總計約 {typical_total} 分鐘（超時上限 {timeout_total} 分鐘）")
+            print("  ─ 這些訓練只在首次運行需要全部跑一次；之後依各自週期排程")
+            print("  ─ 若想稍後再訓練：設環境變數 STRATEGY_SKIP_SCHEDULER=1 略過")
+        else:
+            print(f"\n★ 將執行 {len(to_run)} 個到期任務（典型 ~{typical_total} 分鐘 / 超時 {timeout_total} 分鐘）")
+            print("  注：此為超時上限，實際通常短很多。若要略過請設定 STRATEGY_SKIP_SCHEDULER=1")
 
     for task in to_run:
         res = _run_task(task, dry_run=dry_run)

@@ -1,31 +1,53 @@
-# Core data
+# ============================================================
+# 核心資料處理
+# ============================================================
 pandas>=2.0
 numpy>=1.24
 requests>=2.31
 
-# Financial data
+# ============================================================
+# 行情/財報資料
+# ============================================================
 yfinance>=0.2.40
-
-# Visualization / Report
-plotly>=5.18
-
-# ML / Ranking
-xgboost>=2.0
-
-# Deep Learning (CUDA 12.8 wheel; 使用純 CPU 可省略 --index-url)
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-torch>=2.2
-
-# GPU grid search (Numba CUDA)
-# 若無 GPU 可略過以下 numba 相關依賴
-numba>=0.59
-# Windows + CUDA 12.x 需要以下 NVIDIA runtime wheels：
-# numba-cuda
-# nvidia-cuda-runtime-cu12
-# nvidia-cuda-nvcc-cu12
-# nvidia-cuda-nvrtc-cu12
-# nvidia-nvjitlink-cu12
-
-# HTML parsing (pandas read_html backend)
 html5lib>=1.1
 lxml>=5.0
+
+# ============================================================
+# 視覺化 / HTML 報告
+# ============================================================
+plotly>=5.18
+
+# ============================================================
+# 機器學習 / Ranking
+# ============================================================
+# XGBoost：CPU 即可；若要 device='cuda' 需安裝 GPU 版 (xgboost-cuda)
+# 系統會自動 fallback 到 CPU（A5 修正）
+xgboost>=2.0
+scikit-learn>=1.3   # 計算 IC、AUC、Reliability 等診斷
+
+# ============================================================
+# 深度學習（PyTorch GRU/Transformer/Conformal/Breakout/MC）
+# ============================================================
+# CPU 版直接：pip install torch torchvision torchaudio
+# CUDA 12.8（RTX 50 系列建議）：
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# 若使用較舊 CUDA：請改 cu121 / cu118 對應 wheel
+torch>=2.2
+
+# ============================================================
+# Numba CUDA 參數網格回測（路線 1：gpu_backtest.py）
+# CPU 環境下會 fallback 至 numpy 路徑，無 GPU 也可省略以下依賴
+# ============================================================
+numba>=0.59
+# 以下為 Windows + CUDA 12.x 的 NVIDIA runtime wheels（pip 安裝即可）：
+#   pip install numba-cuda nvidia-cuda-runtime-cu12 nvidia-cuda-nvcc-cu12 \
+#               nvidia-cuda-nvrtc-cu12 nvidia-nvjitlink-cu12
+# 若 GPU 是 RTX 50 系列（Blackwell sm_120），建議使用 PyTorch nightly cu128 build
+# 可用以下指令驗證 CUDA 能用：
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+# ============================================================
+# 選用：開發/分析工具
+# ============================================================
+# tqdm>=4.65        # 進度條
+# matplotlib>=3.8   # 額外靜態圖（plotly 已涵蓋大多需求）

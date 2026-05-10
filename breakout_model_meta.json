@@ -1,0 +1,41 @@
+{
+  "features": [
+    "logret_1d",
+    "close_ma5",
+    "close_ma20",
+    "close_ma60",
+    "vol_ratio",
+    "rsi_n",
+    "k_n",
+    "d_n",
+    "macd_hist_n",
+    "bb_pos",
+    "atr_pct",
+    "hl_range",
+    "dist_52w",
+    "log_vol_z",
+    "ret_5d_cum",
+    "ret_20d_cum",
+    "vol_of_vol_20d",
+    "pv_corr_20d",
+    "range_expand",
+    "volume_surge_5d",
+    "rsi_slope_5d",
+    "macd_hist_slope",
+    "squeeze_intensity",
+    "trend_strength"
+  ],
+  "window": 60,
+  "breakout_window": 10,
+  "breakout_threshold": 0.1,
+  "calibration": {
+    "best_thr": 0.6500000000000001,
+    "best_f1": 0.4934728049753245,
+    "precision": 0.3669833614661201,
+    "recall": 0.7530182480307168,
+    "p_at_5": 0.61086240391925,
+    "p_at_10": 0.5621674127882422,
+    "p_at_20": 0.4885233439618219
+  },
+  "trained_at": "2026-05-10T23:38:29.852937"
+}
